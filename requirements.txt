@@ -1,2 +1,4 @@
 pdfminer.six
 rich==13.7.0
+nltk
+camelot-py
