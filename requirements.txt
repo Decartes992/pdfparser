@@ -1,4 +1,7 @@
 pdfminer.six
+pytesseract
+pdf2image
+Pillow
 rich==13.7.0
 nltk
 camelot-py
