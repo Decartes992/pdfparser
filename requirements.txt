@@ -1,6 +1,6 @@
 pdfminer.six
 pytesseract
-pdf2image
+PyMuPDF>=1.23.0
 Pillow
 rich==13.7.0
 nltk

@@ -1,14 +1,15 @@
 import json  # For handling JSON data
 import re  # For regular expressions
 from pathlib import Path  # For handling file paths
+import fitz # For PyMuPDF PDF handling
 from pdfminer.high_level import extract_pages  # For extracting pages from PDF
 from pdfminer.layout import LAParams, LTTextContainer  # For layout analysis
 from rich.console import Console  # For colorful console output
 import pytesseract  # For OCR capabilities
-from pdf2image import convert_from_path  # For converting PDF pages to images
 from PIL import Image  # For image processing
 import io  # For byte stream handling
 import os  # For OS operations
+import gc # For garbage collection
 
 console = Console()  # Initialize console
 
@@ -82,11 +83,11 @@ class PDFToJSONConverter:
             list: List of extracted paragraphs.
         """
         paragraphs = []
+        doc = None # Initialize doc to ensure it's available in finally block
         try:
-            # Get total page count
-            from pdf2image.pdf2image import pdfinfo_from_path
-            info = pdfinfo_from_path(pdf_path)
-            total_pages = info["Pages"]
+            # Open PDF and get page count using PyMuPDF
+            doc = fitz.open(pdf_path)
+            total_pages = doc.page_count
             
             console.print(f"[yellow]Processing {pdf_path} with OCR - {total_pages} pages total[/yellow]")
             
@@ -95,70 +96,78 @@ class PDFToJSONConverter:
             
             for start_page in range(1, total_pages + 1, batch_size):
                 end_page = min(start_page + batch_size - 1, total_pages)
-                console.print(f"[yellow]Converting pages {start_page}-{end_page} of {total_pages} to images[/yellow]")
-                
-                # Convert only a batch of pages to images
-                try:
-                    images = convert_from_path(
-                        pdf_path,
-                        dpi=self.dpi,
-                        first_page=start_page,
-                        last_page=end_page
-                    )
-                    
-                    # Process each page in the batch with OCR
-                    for i, image in enumerate(images):
-                        page_num = start_page + i
-                        console.print(f"[yellow]OCR processing page {page_num}/{total_pages}[/yellow]")
+                console.print(f"[yellow]Processing pages {start_page}-{end_page} of {total_pages}[/yellow]")
+
+                # Process pages within the current batch range
+                for page_num in range(start_page, min(start_page + batch_size, total_pages + 1)):
+                    console.print(f"[yellow]OCR processing page {page_num}/{total_pages}[/yellow]")
+                    img = None # Initialize img for this page iteration
+                    pix = None # Initialize pix for this page iteration
+                    try:
+                        # Load page using PyMuPDF (0-indexed)
+                        page = doc.load_page(page_num - 1)
                         
+                        # Render page to pixmap
+                        pix = page.get_pixmap(dpi=self.dpi)
+                        
+                        # Convert pixmap to PIL Image
+                        try:
+                            if pix.alpha:
+                                img = Image.frombytes("RGBA", [pix.width, pix.height], pix.samples)
+                            else:
+                                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                        except Exception as img_conv_e:
+                            console.print(f"[bold red]Error converting page {page_num} pixmap to PIL Image: {img_conv_e}[/bold red]")
+                            continue # Skip this page if conversion fails
+                        finally:
+                             pix = None # Ensure pixmap is dereferenced even if conversion fails
+
                         # Free memory by resizing the image if it's very large
-                        width, height = image.size
+                        width, height = img.size
                         if width > 3000 or height > 3000:
                             scale_factor = min(3000/width, 3000/height)
                             new_width = int(width * scale_factor)
                             new_height = int(height * scale_factor)
-                            image = image.resize((new_width, new_height), Image.LANCZOS)
+                            img = img.resize((new_width, new_height), Image.LANCZOS)
                             
                         # Extract text from the image using pytesseract
-                        try:
-                            text = pytesseract.image_to_string(image, lang=self.ocr_language)
-                            
-                            # Process the extracted text
-                            lines = text.split('\n')
-                            current_paragraph = []
-                            
-                            for line in lines:
-                                cleaned_line = self.clean_text(line)
-                                if not cleaned_line or self.should_filter_line(cleaned_line):
-                                    if current_paragraph:
-                                        paragraph_text = ' '.join(current_paragraph)
-                                        if len(paragraph_text) >= self.min_paragraph_length:
-                                            paragraphs.append(paragraph_text)
-                                        current_paragraph = []
-                                else:
-                                    current_paragraph.append(cleaned_line)
-                            
-                            # Add the last paragraph if it exists
-                            if current_paragraph:
-                                paragraph_text = ' '.join(current_paragraph)
-                                if len(paragraph_text) >= self.min_paragraph_length:
-                                    paragraphs.append(paragraph_text)
-                                    
-                            # Force garbage collection to free memory
-                            import gc
-                            gc.collect()
-                            
-                        except Exception as e:
-                            console.print(f"[bold red]Error OCR processing page {page_num}: {e}[/bold red]")
-                            continue  # Skip problematic page and continue with next
-                            
-                    # Clear batch images to free memory
-                    images = None
-                    gc.collect()
-                    
-                except Exception as e:
-                    console.print(f"[bold red]Error converting pages {start_page}-{end_page}: {e}[/bold red]")
-                    continue  # Try next batch
+                        text = pytesseract.image_to_string(img, lang=self.ocr_language)
+                        
+                        # Process the extracted text (same logic as before)
+                        lines = text.split('\n')
+                        current_paragraph = []
+                        
+                        for line in lines:
+                            cleaned_line = self.clean_text(line)
+                            if not cleaned_line or self.should_filter_line(cleaned_line):
+                                if current_paragraph:
+                                    paragraph_text = ' '.join(current_paragraph)
+                                    if len(paragraph_text) >= self.min_paragraph_length:
+                                        paragraphs.append(paragraph_text)
+                                    current_paragraph = []
+                            else:
+                                current_paragraph.append(cleaned_line)
+                        
+                        # Add the last paragraph if it exists
+                        if current_paragraph:
+                            paragraph_text = ' '.join(current_paragraph)
+                            if len(paragraph_text) >= self.min_paragraph_length:
+                                paragraphs.append(paragraph_text)
+                                
+                    except Exception as page_e:
+                        console.print(f"[bold red]Error OCR processing page {page_num}: {page_e}[/bold red]")
+                        # Continue to the next page even if one fails
+                    finally:
+                        # Clean up PIL image object for the current page
+                        if img:
+                            img.close()
+                            img = None
+                        # Force garbage collection periodically (after each page in this case)
+                        # Note: gc import moved to top level if not already there
+                        # gc is imported at the top level
+                        gc.collect()
+
+                # No batch-level image list to clear anymore
             
             console.print(f"[green]OCR completed: extracted {len(paragraphs)} paragraphs[/green]")
             return paragraphs
@@ -166,6 +175,11 @@ class PDFToJSONConverter:
         except Exception as e:
             console.print(f"[bold red]Error processing {pdf_path} with OCR: {e}[/bold red]")
             return None
+        finally:
+            # Ensure the document is closed
+            if doc:
+                doc.close()
+                console.print(f"[dim]Closed PDF document: {pdf_path}[/dim]")
 
     def extract_text_from_pdf(self, pdf_path):
         """
